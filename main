@@ -1,0 +1,79 @@
+# train_xgb_optuna.py
+import pandas as pd, numpy as np, xgboost as xgb, optuna, joblib, os
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, classification_report,
+                             confusion_matrix, precision_recall_curve)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+import seaborn as sns, matplotlib.pyplot as plt
+from datetime import datetime
+
+# --- Load & preprocess ---
+df = pd.read_csv("sim_interview_dataset.csv")
+y, X = df["outcome"], df.drop(columns=["outcome"])
+num, cat = X.select_dtypes(exclude="object"), X.select_dtypes("object")
+le_dict = {c: LabelEncoder().fit(cat[c].fillna("missing")) for c in cat}
+for c, le in le_dict.items(): X[c] = le.transform(cat[c].fillna("missing"))
+X[num.columns] = SimpleImputer(strategy="median").fit_transform(num)
+X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=.2, random_state=42)
+
+# --- Optuna tuning ---
+def objective(trial):
+    p = dict(max_depth=trial.suggest_int("max_depth",3,10),
+             learning_rate=trial.suggest_float("learning_rate",0.01,0.3,log=True),
+             subsample=trial.suggest_float("subsample",.6,1.0),
+             colsample_bytree=trial.suggest_float("colsample_bytree",.6,1.0),
+             min_child_weight=trial.suggest_int("min_child_weight",1,10),
+             gamma=trial.suggest_float("gamma",0,5),
+             reg_alpha=trial.suggest_float("reg_alpha",0,2),
+             reg_lambda=trial.suggest_float("reg_lambda",0,2),
+             objective="binary:logistic", eval_metric="auc", seed=42)
+    n_rounds = trial.suggest_int("n_rounds",100,600)
+    skf, aucs = StratifiedKFold(3, shuffle=True, random_state=42), []
+    for tr, va in skf.split(X_train, y_train):
+        dtr, dva = xgb.DMatrix(X_train.iloc[tr], y_train.iloc[tr]), xgb.DMatrix(X_train.iloc[va], y_train.iloc[va])
+        bst = xgb.train(p, dtr, n_rounds, [(dva,"val")], early_stopping_rounds=50, verbose_eval=False)
+        aucs.append(roc_auc_score(y_train.iloc[va], bst.predict(dva)))
+    return np.mean(aucs)
+
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30, timeout=600)
+best = study.best_params; best["scale_pos_weight"] = (y_train==0).sum()/(y_train==1).sum()
+
+# --- Train final model ---
+dtrain, dtest = xgb.DMatrix(X_train, y_train), xgb.DMatrix(X_test, y_test)
+model = xgb.train(best, dtrain, int(best.pop("n_rounds")*1.2),
+                  [(dtrain,"train"),(dtest,"test")], early_stopping_rounds=50, verbose_eval=False)
+
+# --- Tune threshold ---
+idx = X_train.sample(frac=.2, random_state=99).index
+y_prob = model.predict(xgb.DMatrix(X_train.loc[idx]))
+prec, rec, thr = precision_recall_curve(y_train.loc[idx], y_prob)
+thr_opt = thr[np.argmax(2*prec*rec/(prec+rec+1e-12))]
+
+# --- Evaluate ---
+y_test_p = model.predict(dtest)
+y_pred = (y_test_p >= thr_opt).astype(int)
+print("\nFinal Metrics:")
+for m,v in dict(Acc=accuracy_score(y_test,y_pred),
+                Prec=precision_score(y_test,y_pred),
+                Rec=recall_score(y_test,y_pred),
+                F1=f1_score(y_test,y_pred),
+                AUC=roc_auc_score(y_test,y_test_p)).items():
+    print(f"{m}: {v:.4f}")
+print(classification_report(y_test,y_pred))
+
+# --- Save outputs ---
+os.makedirs("model_artifacts", exist_ok=True)
+model.save_model("model_artifacts/xgb_model.json")
+joblib.dump([le_dict, thr_opt], "model_artifacts/encoders_thresh.pkl")
+joblib.dump(SimpleImputer(strategy="median").fit(num), "model_artifacts/imputer.pkl")
+pd.DataFrame({"features": X.columns}).to_csv("model_artifacts/features.csv", index=False)
+with open("model_artifacts/summary.txt","w") as f:
+    f.write(f"Run {datetime.now()}\nBest AUC {study.best_value:.5f}\nThr {thr_opt:.3f}\n")
+
+# --- Confusion matrix plot ---
+sns.heatmap(confusion_matrix(y_test,y_pred), annot=True, fmt="d", cmap="Blues")
+plt.title("Confusion Matrix"); plt.savefig("model_artifacts/confusion_matrix.png"); plt.close()
+print("Artifacts saved → model_artifacts/")
