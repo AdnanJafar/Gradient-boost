@@ -77,3 +77,32 @@ with open("model_artifacts/summary.txt","w") as f:
 sns.heatmap(confusion_matrix(y_test,y_pred), annot=True, fmt="d", cmap="Blues")
 plt.title("Confusion Matrix"); plt.savefig("model_artifacts/confusion_matrix.png"); plt.close()
 print("Artifacts saved → model_artifacts/")
+
+
+
+
+# --- Feature Importance (Gain-based) ---
+# Extract feature importances from the trained model
+importance_dict = model.get_score(importance_type='gain')
+
+# Convert to DataFrame
+importance_df = (
+    pd.DataFrame(list(importance_dict.items()), columns=["Feature", "Importance"])
+    .sort_values("Importance", ascending=False)
+)
+
+# Print top features
+print("\nTop 10 Important Features:")
+print(importance_df.head(10))
+
+# Plot top 12 feature importances
+plt.figure(figsize=(10, 6))
+sns.barplot(data=importance_df.head(12), x="Importance", y="Feature", palette="viridis")
+plt.title("Top 12 Feature Importances (Gain)")
+plt.tight_layout()
+plt.savefig("model_artifacts/feature_importance.png")
+plt.close()
+
+# Save importance data as CSV
+importance_df.to_csv("model_artifacts/feature_importance.csv", index=False)
+print("Feature importance saved → model_artifacts/feature_importance.png & .csv")
